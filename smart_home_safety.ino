@@ -13,11 +13,11 @@
 
 // ───────── WiFi + Telegram config ─────────
 
-const char* ssid = "one";
-const char* password = "12345678";
+const char* ssid = "wifi_name";
+const char* password = "password";
 
-#define BOT_TOKEN "8690322306:AAHKOT3VrT_jnvS_K3S4HdsG0-WaWdMo-wk"
-#define CHAT_ID "7687474461"
+#define BOT_TOKEN "token_number"
+#define CHAT_ID "bot_chat_id"
 
 WiFiClientSecure client;
 UniversalTelegramBot bot(BOT_TOKEN, client);
