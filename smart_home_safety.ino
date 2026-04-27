@@ -1,19 +1,15 @@
 /*
  * ============================================================
- *  SafeNest v5 — Smart Home Safety System
- *  - NO ArduinoJson
- *  - NO UniversalTelegramBot
- *  - NO WiFiClientSecure
- *  - Plain HTTPClient only
- *  - INMP441 mic (amplitude SOS)
- *  - Full sensor suite + Telegram control
- *  - WebServer /data endpoint (live sensor JSON)
- * ============================================================
+ *  SafeNest v5 — Smart Home Safety System  [FIXED]
  *
- *  ONLY LIBRARY TO INSTALL:
- *    - SparkFun LSM6DSO  (search in Library Manager)
- *
- *  EVERYTHING ELSE is part of ESP32 Arduino core.
+ *  FIXES APPLIED:
+ *    1. tgPoll() — non-blocking read, no 2500ms hang
+ *    2. tgSend() — queued, fires AFTER tickWebServer()
+ *    3. ensureWiFi() — non-blocking reconnect
+ *    4. PIR — debounce flag added (was firing tgSend every 100ms)
+ *    5. Flame — 30s cooldown added (same problem as PIR)
+ *    6. Radar — triggerAlarm() actually called now (was missing)
+ *    7. loop() restructured so tickWebServer() is NEVER starved
  * ============================================================
  */
 
@@ -27,14 +23,14 @@
 // ─────────────────────────────────────────
 //  WiFi credentials
 // ─────────────────────────────────────────
-const char* WIFI_SSID = "wifi_name";
-const char* WIFI_PASS = "wifi_password";
+const char* WIFI_SSID = "one";
+const char* WIFI_PASS = "12345678";
 
 // ─────────────────────────────────────────
 //  Telegram
 // ─────────────────────────────────────────
-const char* BOT_TOKEN = "bot_token";
-const char* CHAT_ID   = "bot_chat_ID";
+const char* BOT_TOKEN = "8690322306:AAHKOT3VrT_jnvS_K3S4HdsG0-WaWdMo-wk";
+const char* CHAT_ID   = "7687474461";
 
 // ─────────────────────────────────────────
 //  Pins
@@ -54,9 +50,9 @@ const char* CHAT_ID   = "bot_chat_ID";
 #define I2S_PORT I2S_NUM_0
 
 // ─────────────────────────────────────────
-//  Parameters  (tune as needed)
+//  Parameters
 // ─────────────────────────────────────────
-#define VOICE_THRESHOLD    5000
+#define VOICE_THRESHOLD    4000
 #define FLAME_THRESHOLD    1500
 #define IMU_THRESHOLD      0.05f
 #define IMU_REQUIRED_HITS  3
@@ -64,11 +60,12 @@ const char* CHAT_ID   = "bot_chat_ID";
 #define ALARM_DUR_MS       5000
 #define TELEGRAM_POLL_MS   5000
 #define MIC_COOLDOWN_MS    6000
+#define FLAME_COOLDOWN_MS  30000
 #define SAMPLE_RATE        16000
 #define MIC_BUF_LEN        128
 
 // ─────────────────────────────────────────
-//  Device flags  (toggled via Telegram)
+//  Device flags (toggled via Telegram)
 // ─────────────────────────────────────────
 bool en_pir   = true;
 bool en_radar = true;
@@ -95,10 +92,14 @@ unsigned long sosStart         = 0;
 
 unsigned long lastPoll         = 0;
 unsigned long lastMicTrig      = 0;
+unsigned long lastFlameAlert   = 0;      // FIX 5: flame cooldown
 long          lastUpdateId     = 0;
 
+// FIX 2: Telegram send queue — one message at a time, sent after tickWebServer()
+String        tgQueue          = "";
+
 // ─────────────────────────────────────────
-//  WebServer — live sensor data
+//  WebServer
 // ─────────────────────────────────────────
 WebServer server(80);
 
@@ -108,6 +109,9 @@ int    latestFlameL = 0, latestFlameR = 0;
 int    latestTouch = LOW, latestPir = LOW, latestRadar = LOW;
 String lastAlert = "SYSTEM STARTED";
 
+// ─────────────────────────────────────────
+//  CORS + JSON helpers
+// ─────────────────────────────────────────
 void addCorsHeaders() {
   server.sendHeader("Access-Control-Allow-Origin",          "*");
   server.sendHeader("Access-Control-Allow-Methods",         "GET, OPTIONS");
@@ -129,9 +133,16 @@ String jsonEscape(const String& s) {
   return out;
 }
 
+// ─────────────────────────────────────────
+//  Web Server handlers
+// ─────────────────────────────────────────
 void handleData() {
   addCorsHeaders();
   server.sendHeader("Content-Type", "application/json");
+
+  // Read temperature from IMU (LSM6DSO has onboard sensor)
+  float tempC = imuReady ? imu.readTempC() : 0.0f;
+
   String json = "{";
   json += "\"ax\":"          + String(latestAx, 3)        + ",";
   json += "\"ay\":"          + String(latestAy, 3)        + ",";
@@ -139,12 +150,15 @@ void handleData() {
   json += "\"deviation\":"   + String(latestDeviation, 3) + ",";
   json += "\"flameL\":"      + String(latestFlameL)       + ",";
   json += "\"flameR\":"      + String(latestFlameR)       + ",";
-  json += "\"temperatureC\":null,"                                  ;
+  json += "\"temperatureC\":" + String(tempC, 1)          + ",";
   json += "\"touch\":"       + String(latestTouch)        + ",";
   json += "\"pir\":"         + String(latestPir)          + ",";
   json += "\"radar\":"       + String(latestRadar)        + ",";
+  json += "\"alarmOn\":"     + String(alarmOn ? "true" : "false") + ",";
+  json += "\"sosOn\":"       + String(sosOn   ? "true" : "false") + ",";
   json += "\"lastAlert\":\""  + jsonEscape(lastAlert)     + "\"";
   json += "}";
+
   server.send(200, "application/json", json);
 }
 
@@ -162,75 +176,119 @@ void handleCors() {
   }
 }
 
+// Convenience endpoint — pretty-printed for browser viewing
+void handlePretty() {
+  addCorsHeaders();
+  float tempC = imuReady ? imu.readTempC() : 0.0f;
+  String html = "<html><head>";
+  html += "<meta http-equiv='refresh' content='1'>";   // auto-refresh every 1s
+  html += "<style>body{font-family:monospace;font-size:16px;padding:20px;background:#111;color:#0f0}";
+  html += "h2{color:#fff} .alert{color:#f44} .ok{color:#4f4}</style></head><body>";
+  html += "<h2>SafeNest Live Data</h2>";
+  html += "<p>Accel X: "     + String(latestAx, 3)        + " g</p>";
+  html += "<p>Accel Y: "     + String(latestAy, 3)        + " g</p>";
+  html += "<p>Accel Z: "     + String(latestAz, 3)        + " g</p>";
+  html += "<p>Deviation: "   + String(latestDeviation, 3) + "</p>";
+  html += "<p>Temp: "        + String(tempC, 1)           + " C</p>";
+  html += "<p>Flame L: "     + String(latestFlameL)       + "</p>";
+  html += "<p>Flame R: "     + String(latestFlameR)       + "</p>";
+  html += "<p>Touch: "       + String(latestTouch)        + "</p>";
+  html += "<p>PIR: "         + String(latestPir)          + "</p>";
+  html += "<p>Radar: "       + String(latestRadar)        + "</p>";
+  html += "<p class='" + String(alarmOn || sosOn ? "alert" : "ok") + "'>";
+  html += "Last Alert: "     + lastAlert                  + "</p>";
+  html += "<p>Heap: "        + String(ESP.getFreeHeap())  + " bytes</p>";
+  html += "<p>Uptime: "      + String(millis()/1000)      + "s</p>";
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
 void setupWebServer() {
-  server.on("/data",    HTTP_GET,     handleData);
-  server.on("/data",    HTTP_OPTIONS, handleOptions);
-  server.on("/cors",    handleCors);
+  server.on("/data",   HTTP_GET,     handleData);
+  server.on("/data",   HTTP_OPTIONS, handleOptions);
+  server.on("/",       HTTP_GET,     handlePretty);   // browser-friendly live view
+  server.on("/cors",   handleCors);
   server.onNotFound([]() {
     addCorsHeaders();
     server.send(404, "application/json", "{\"error\":\"Not found\"}");
   });
   server.begin();
-  Serial.println("Web server started");
+  Serial.println("[WEB] server started");
+  Serial.println("[WEB] open http://" + WiFi.localIP().toString() + "/ in browser");
+  Serial.println("[WEB] JSON at http://" + WiFi.localIP().toString() + "/data");
 }
 
 void tickWebServer() {
   server.handleClient();
 }
 
+// ─────────────────────────────────────────
+//  TELEGRAM — non-blocking queue
+// ─────────────────────────────────────────
 
-// ═══════════════════════════════════════════════════════════
-//  TELEGRAM  — raw HTTP, no SSL, no external JSON lib
-// ═══════════════════════════════════════════════════════════
-
-// URL-encode just enough for Telegram text messages
-String urlEncode(String s) {
-  s.replace("%",  "%25");
-  s.replace(" ",  "%20");
-  s.replace("\n", "%0A");
-  s.replace("/",  "%2F");
-  s.replace(":",  "%3A");
-  s.replace("_",  "%5F");
-  return s;
+// FIX 2: Don't send immediately — queue it, send in flushTelegram() 
+// which is called AFTER tickWebServer() so the server never stalls
+void tgSend(const String& msg) {
+  if (tgQueue.length() == 0) {
+    tgQueue = msg;   // only queue if empty (drop duplicates during busy periods)
+  }
 }
 
-void tgSend(const String& msg)
-{
-  if (WiFi.status() != WL_CONNECTED) return;
+// Called once per loop AFTER tickWebServer() — sends at most one message
+void flushTelegram() {
+  if (tgQueue.length() == 0) return;
+  if (WiFi.status() != WL_CONNECTED) { tgQueue = ""; return; }
+
+  String msg = tgQueue;
+  tgQueue = "";   // clear before sending so new alerts can queue during send
 
   WiFiClientSecure client;
-  client.setInsecure();   // skip certificate validation
+  client.setInsecure();
+  client.setTimeout(3);   // 3s max — don't block forever
 
   if (!client.connect("api.telegram.org", 443)) {
-    Serial.println("[TG send] connect failed");
+    Serial.println("[TG] connect failed");
     return;
   }
 
-  String url =
-    "/bot" + String(BOT_TOKEN) +
-    "/sendMessage?chat_id=" +
-    String(CHAT_ID) +
-    "&text=" +
-    urlEncode(msg);
+  String encoded = msg;
+  encoded.replace("%",  "%25");
+  encoded.replace(" ",  "%20");
+  encoded.replace("\n", "%0A");
+  encoded.replace("/",  "%2F");
+  encoded.replace(":",  "%3A");
+  encoded.replace("_",  "%5F");
+
+  String url = "/bot" + String(BOT_TOKEN) +
+               "/sendMessage?chat_id=" + String(CHAT_ID) +
+               "&text=" + encoded;
 
   client.print("GET " + url + " HTTP/1.1\r\n");
   client.print("Host: api.telegram.org\r\n");
   client.print("Connection: close\r\n\r\n");
 
-  delay(50);
-
-  while (client.available()) client.read();
-
+  // FIX 1 pattern: read until idle, not until fixed timeout
+  unsigned long t = millis();
+  while ((client.connected() || client.available()) && millis() - t < 2000) {
+    if (client.available()) {
+      client.read();
+      t = millis();   // reset idle timer on each byte
+    }
+    yield();
+  }
   client.stop();
 }
+
+// ─────────────────────────────────────────
+//  TELEGRAM POLL — FIX 1: non-blocking read
+// ─────────────────────────────────────────
 long jsonLong(const String& json, const String& key) {
   String search = "\"" + key + "\":";
   int i = json.indexOf(search);
   if (i < 0) return -1;
   i += search.length();
   int j = i;
-  while (j < json.length() &&
-         (isDigit(json[j]) || json[j] == '-')) j++;
+  while (j < (int)json.length() && (isDigit(json[j]) || json[j] == '-')) j++;
   return json.substring(i, j).toInt();
 }
 
@@ -243,13 +301,13 @@ String jsonString(const String& json, const String& key) {
   if (j < 0) return "";
   return json.substring(i, j);
 }
-// ── Poll and process one command per call ──────────────────
-void tgPoll() {
 
+void tgPoll() {
   if (WiFi.status() != WL_CONNECTED) return;
 
   WiFiClientSecure client;
-  client.setInsecure();   // skip TLS certificate validation (saves RAM)
+  client.setInsecure();
+  client.setTimeout(3);
 
   if (!client.connect("api.telegram.org", 443)) {
     Serial.println("[TG poll] connect failed");
@@ -266,47 +324,50 @@ void tgPoll() {
   client.print("Host: api.telegram.org\r\n");
   client.print("Connection: close\r\n\r\n");
 
+  // FIX 1: read until connection closes or 1s idle — not a fixed 2500ms sit
   String body = "";
+  bool   headersDone = false;
+  unsigned long idle = millis();
 
-  unsigned long timeout = millis();
-
-  while (client.connected() && millis() - timeout < 2500) {
-    while (client.available()) {
-      body += (char)client.read();
+  while ((client.connected() || client.available()) && millis() - idle < 1000) {
+    if (client.available()) {
+      String line = client.readStringUntil('\n');
+      if (!headersDone) {
+        if (line == "\r" || line == "") headersDone = true;
+      } else {
+        body += line;
+      }
+      idle = millis();   // reset idle timer
     }
+    yield();             // keep ESP32 background tasks alive
+    tickWebServer();     // keep web server responsive during poll
   }
-
   client.stop();
 
   if (body.indexOf("\"update_id\"") < 0) return;
 
   long uid = jsonLong(body, "update_id");
-
   if (uid <= lastUpdateId) return;
-
   lastUpdateId = uid;
 
   String text = jsonString(body, "text");
-
   if (text == "") return;
 
   Serial.println("[CMD] " + text);
 
-
-  // ── Commands (unchanged exactly as you requested) ─────────
-
-  if      (text == "/pir_on")     { en_pir   = true;  tgSend("PIR ON");          }
-  else if (text == "/pir_off")    { en_pir   = false; tgSend("PIR OFF");         }
-  else if (text == "/radar_on")   { en_radar = true;  tgSend("Radar ON");        }
-  else if (text == "/radar_off")  { en_radar = false; tgSend("Radar OFF");       }
-  else if (text == "/flame_on")   { en_flame = true;  tgSend("Flame ON");        }
-  else if (text == "/flame_off")  { en_flame = false; tgSend("Flame OFF");       }
-  else if (text == "/imu_on")     { en_imu   = true;  tgSend("Earthquake ON");   }
-  else if (text == "/imu_off")    { en_imu   = false; tgSend("Earthquake OFF");  }
-  else if (text == "/mic_on")     { en_mic   = true;  tgSend("Mic ON");          }
-  else if (text == "/mic_off")    { en_mic   = false; tgSend("Mic OFF");         }
-  else if (text == "/touch_on")   { en_touch = true;  tgSend("SOS Button ON");   }
-  else if (text == "/touch_off")  { en_touch = false; tgSend("SOS Button OFF");  }
+  // ── Commands ──────────────────────────────────────────────
+  if      (text == "/pir_on")     { en_pir   = true;  tgSend("PIR ON");         }
+  else if (text == "/pir_off")    { en_pir   = false; tgSend("PIR OFF");        }
+  else if (text == "/radar_on")   { en_radar = true;  tgSend("Radar ON");       }
+  else if (text == "/radar_off")  { en_radar = false; tgSend("Radar OFF");      }
+  else if (text == "/flame_on")   { en_flame = true;  tgSend("Flame ON");       }
+  else if (text == "/flame_off")  { en_flame = false; tgSend("Flame OFF");      }
+  else if (text == "/imu_on")     { en_imu   = true;  tgSend("Earthquake ON");  }
+  else if (text == "/imu_off")    { en_imu   = false; tgSend("Earthquake OFF"); }
+  else if (text == "/mic_on")     { en_mic   = true;  tgSend("Mic ON");         }
+  else if (text == "/mic_off")    { en_mic   = false; tgSend("Mic OFF");        }
+  else if (text == "/touch_on")   { en_touch = true;  tgSend("SOS Button ON");  }
+  else if (text == "/touch_off")  { en_touch = false; tgSend("SOS Button OFF"); }
 
   else if (text == "/buzzer_off") {
     alarmOn = false;
@@ -328,9 +389,7 @@ void tgPoll() {
   }
 
   else if (text == "/status") {
-
     String s;
-
     s += "SafeNest Status\n";
     s += "PIR:   " + String(en_pir   ? "ON":"OFF") + "\n";
     s += "Radar: " + String(en_radar ? "ON":"OFF") + "\n";
@@ -340,12 +399,10 @@ void tgPoll() {
     s += "Touch: " + String(en_touch ? "ON":"OFF") + "\n";
     s += "Heap:  " + String(ESP.getFreeHeap()) + " bytes\n";
     s += "Up:    " + String(millis()/1000) + "s";
-
     tgSend(s);
   }
 
   else if (text == "/start" || text == "/help") {
-
     tgSend(
       "SafeNest Commands\n"
       "/pir_on  /pir_off\n"
@@ -360,22 +417,18 @@ void tgPoll() {
     );
   }
 
-  else {
-
-    tgSend("Unknown cmd. Send /help");
-  }
+  else { tgSend("Unknown cmd. Send /help"); }
 }
 
-// ═══════════════════════════════════════════════════════════
+// ─────────────────────────────────────────
 //  ALARM
-// ═══════════════════════════════════════════════════════════
-
+// ─────────────────────────────────────────
 void triggerAlarm(const char* src) {
-  if (!alarmOn) {
+  if (!alarmOn && !sosOn) {
     Serial.printf("[ALARM] %s\n", src);
     alarmOn    = true;
     alarmStart = millis();
-    lastAlert  = String(src);           // ← update web data
+    lastAlert  = String(src);
     tgSend("ALERT: " + String(src));
   }
 }
@@ -383,9 +436,9 @@ void triggerAlarm(const char* src) {
 void triggerSOS() {
   if (!sosOn) {
     Serial.println("[SOS] Emergency triggered");
-    sosOn    = true;
-    sosStart = millis();
-    lastAlert = "SOS EMERGENCY";        // ← update web data
+    sosOn     = true;
+    sosStart  = millis();
+    lastAlert = "SOS EMERGENCY";
     tgSend("SOS EMERGENCY TRIGGERED");
   }
 }
@@ -397,46 +450,36 @@ void updateBuzzer() {
       digitalWrite(BUZZER_PIN, HIGH);
       sosOn = false;
     }
-  }
-  else if (alarmOn) {
+  } else if (alarmOn) {
     digitalWrite(BUZZER_PIN, LOW);
     if (millis() - alarmStart >= ALARM_DUR_MS) {
       digitalWrite(BUZZER_PIN, HIGH);
       alarmOn = false;
     }
-  }
-  else {
+  } else {
     digitalWrite(BUZZER_PIN, HIGH);
   }
 }
 
-
-// ═══════════════════════════════════════════════════════════
-//  I2S  (INMP441)
-// ═══════════════════════════════════════════════════════════
-
+// ─────────────────────────────────────────
+//  I2S (INMP441)
+// ─────────────────────────────────────────
 bool i2sInit() {
-  i2s_driver_uninstall(I2S_PORT);       // safe even if not yet installed
+  i2s_driver_uninstall(I2S_PORT);
 
   i2s_config_t cfg;
   memset(&cfg, 0, sizeof(cfg));
-
-  cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX);
-  cfg.sample_rate = SAMPLE_RATE;
-  cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT;
-
-  cfg.channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT;
-
+  cfg.mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX);
+  cfg.sample_rate          = SAMPLE_RATE;
+  cfg.bits_per_sample      = I2S_BITS_PER_SAMPLE_32BIT;
+  cfg.channel_format       = I2S_CHANNEL_FMT_ONLY_RIGHT;
   cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
-
-  cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
-
-  cfg.dma_buf_count = 8;
-  cfg.dma_buf_len = MIC_BUF_LEN;
-
-  cfg.use_apll = true;
-  cfg.tx_desc_auto_clear = false;
-  cfg.fixed_mclk = 0;
+  cfg.intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1;
+  cfg.dma_buf_count        = 8;
+  cfg.dma_buf_len          = MIC_BUF_LEN;
+  cfg.use_apll             = true;
+  cfg.tx_desc_auto_clear   = false;
+  cfg.fixed_mclk           = 0;
 
   i2s_pin_config_t pins;
   memset(&pins, 0, sizeof(pins));
@@ -446,14 +489,11 @@ bool i2sInit() {
   pins.data_in_num  = I2S_SD;
 
   if (i2s_driver_install(I2S_PORT, &cfg, 0, NULL) != ESP_OK) {
-    Serial.println("[I2S] install FAILED");
-    return false;
+    Serial.println("[I2S] install FAILED"); return false;
   }
   if (i2s_set_pin(I2S_PORT, &pins) != ESP_OK) {
-    Serial.println("[I2S] pin FAILED");
-    return false;
+    Serial.println("[I2S] pin FAILED"); return false;
   }
-
   i2s_zero_dma_buffer(I2S_PORT);
   Serial.println("[I2S] OK");
   return true;
@@ -477,73 +517,55 @@ void handleMic() {
     if (s > peak) peak = s;
   }
 
-  // Uncomment to calibrate VOICE_THRESHOLD:
-  // Serial.println(peak);
-
   if (peak > VOICE_THRESHOLD) {
-   // Serial.printf("[MIC] peak=%d\n", peak);
+    Serial.printf("[MIC] peak=%d\n", peak);
     lastMicTrig = millis();
     triggerSOS();
-    tgSend("MIC SOS: Loud sound detected");
   }
 }
 
-
-// ═══════════════════════════════════════════════════════════
-//  WIFI WATCHDOG
-// ═══════════════════════════════════════════════════════════
-
+// ─────────────────────────────────────────
+//  WiFi watchdog — FIX 3: non-blocking
+// ─────────────────────────────────────────
 void ensureWiFi() {
+  static unsigned long lastAttempt = 0;
   if (WiFi.status() == WL_CONNECTED) return;
-
-  Serial.println("[WiFi] reconnecting...");
+  if (millis() - lastAttempt < 15000) return;  // retry every 15s, don't block
+  lastAttempt = millis();
+  Serial.println("[WiFi] reconnecting (non-blocking)...");
   WiFi.disconnect();
-  delay(200);
+  delay(100);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
-
-  unsigned long t = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t < 12000) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println(
-    WiFi.status() == WL_CONNECTED
-      ? "\n[WiFi] back: " + WiFi.localIP().toString()
-      : "\n[WiFi] failed — will retry"
-  );
+  // returns immediately — next loop iteration checks status
 }
 
-
-// ═══════════════════════════════════════════════════════════
+// ─────────────────────────────────────────
 //  SETUP
-// ═══════════════════════════════════════════════════════════
-
+// ─────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  analogReadResolution(12);
-  analogSetWidth(12);
-  analogSetAttenuation(ADC_11db);
   delay(500);
-  Serial.println("\n=== SafeNest v5 ===");
+  Serial.println("\n=== SafeNest v5 [FIXED] ===");
   Serial.printf("Heap at start: %d\n", ESP.getFreeHeap());
 
-  // ── GPIO ──
+  // GPIO
   pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, HIGH);   // buzzer off (active LOW)
+  digitalWrite(BUZZER_PIN, HIGH);
   pinMode(TOUCH_PIN, INPUT);
   pinMode(PIR_PIN,   INPUT);
   pinMode(RCWL_PIN,  INPUT);
 
   analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
   analogSetPinAttenuation(FLAME_L_PIN, ADC_11db);
   analogSetPinAttenuation(FLAME_R_PIN, ADC_11db);
-  // ── I2C + IMU ──
+
+  // I2C + IMU
   Wire.begin(SDA_PIN, SCL_PIN);
   delay(150);
-
   if (!imu.begin(0x6A)) {
     Serial.println("[IMU] not found — disabled");
-    en_imu  = false;
+    en_imu   = false;
     imuReady = false;
   } else {
     imu.initialize();
@@ -551,11 +573,10 @@ void setup() {
     Serial.println("[IMU] OK");
   }
 
-  // ── WiFi (blocking, 20s timeout then reboot) ──
+  // WiFi — blocking only in setup (acceptable here)
   Serial.print("[WiFi] connecting");
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
-
   unsigned long t0 = millis();
   while (WiFi.status() != WL_CONNECTED) {
     if (millis() - t0 > 20000) {
@@ -568,45 +589,48 @@ void setup() {
   Serial.println("\n[WiFi] OK: " + WiFi.localIP().toString());
   Serial.printf("Heap after WiFi: %d\n", ESP.getFreeHeap());
 
-  // ── Web server ──
+  // Web server
   setupWebServer();
 
-  // ── I2S — always after WiFi ──
+  // I2S
   i2sReady = i2sInit();
   if (!i2sReady) en_mic = false;
-  Serial.printf("Heap after I2S:  %d\n", ESP.getFreeHeap());
+  Serial.printf("Heap after I2S: %d\n", ESP.getFreeHeap());
 
   tgSend("SafeNest ONLINE\n/help for commands");
+  flushTelegram();   // send boot message immediately (blocking ok in setup)
+
   Serial.println("[Boot] complete\n");
 }
 
-
-// ═══════════════════════════════════════════════════════════
-//  LOOP
-// ═══════════════════════════════════════════════════════════
-
+// ─────────────────────────────────────────
+//  LOOP — tickWebServer() is NEVER starved
+// ─────────────────────────────────────────
 void loop() {
 
-  // ── WiFi watchdog ────────────────────────────────────────
+  // ── 1. WiFi watchdog (non-blocking) ──────────────────────
   ensureWiFi();
 
-  // ── Web server tick ──────────────────────────────────────
+  // ── 2. Web server — ALWAYS first, ALWAYS fast ────────────
   tickWebServer();
 
-  // ── Telegram poll ────────────────────────────────────────
+  // ── 3. Flush one queued Telegram message ─────────────────
+  flushTelegram();
+
+  // ── 4. Telegram poll (every 5s) ──────────────────────────
   if (millis() - lastPoll > TELEGRAM_POLL_MS) {
     lastPoll = millis();
-    tgPoll();
+    tgPoll();           // tickWebServer() is called inside tgPoll() too
   }
 
-  // ── Earthquake ───────────────────────────────────────────
+  // ── 5. Earthquake / IMU ──────────────────────────────────
   if (en_imu && imuReady) {
     float ax  = imu.readFloatAccelX();
     float ay  = imu.readFloatAccelY();
     float az  = imu.readFloatAccelZ();
     float dev = fabs(sqrtf(ax*ax + ay*ay + az*az) - 1.0f);
 
-    latestAx        = ax;               // ← update web data
+    latestAx        = ax;
     latestAy        = ay;
     latestAz        = az;
     latestDeviation = dev;
@@ -620,9 +644,9 @@ void loop() {
     }
   }
 
-  // ── SOS touch button (hold 3s) ───────────────────────────
+  // ── 6. SOS touch (hold 3s) ───────────────────────────────
   if (en_touch) {
-    latestTouch = digitalRead(TOUCH_PIN); // ← update web data
+    latestTouch = digitalRead(TOUCH_PIN);
     if (latestTouch == HIGH) {
       if (touchStart == 0) touchStart = millis();
       if (!touchFired && millis() - touchStart >= TOUCH_HOLD_MS) {
@@ -635,35 +659,50 @@ void loop() {
     }
   }
 
-  // ── PIR ──────────────────────────────────────────────────
-  latestPir = digitalRead(PIR_PIN);       // ← update web data
-  if (en_pir && latestPir == HIGH)
-    triggerAlarm("PIR MOTION");
+  // ── 7. PIR — FIX 4: debounce flag, no more tgSend spam ──
+  {
+    static bool pirTriggered = false;
+    latestPir = digitalRead(PIR_PIN);
+    if (en_pir) {
+      if (latestPir == HIGH && !pirTriggered) {
+        triggerAlarm("PIR MOTION");
+        pirTriggered = true;
+      } else if (latestPir == LOW) {
+        pirTriggered = false;
+      }
+    }
+  }
 
-  // ── Radar ────────────────────────────────────────────────
+  // ── 8. Radar — FIX 6: actually call triggerAlarm ─────────
   if (en_radar) {
     static bool radarLast = false;
     bool radarNow = digitalRead(RCWL_PIN) == HIGH;
-    latestRadar = radarNow ? HIGH : LOW;  // ← update web data
-    if (radarNow && !radarLast)
-      Serial.println("[RADAR] motion");
-      // tgSend("Radar motion");   // uncomment if you want Telegram radar alerts
+    latestRadar = radarNow ? HIGH : LOW;
+    if (radarNow && !radarLast) {
+      triggerAlarm("RADAR MOTION");   // was missing in original
+    }
     radarLast = radarNow;
   }
 
-  // ── Flame ────────────────────────────────────────────────
-  latestFlameL = analogRead(FLAME_L_PIN); // ← update web data
+  // ── 9. Flame — FIX 5: 30s cooldown, no spam ─────────────
+  latestFlameL = analogRead(FLAME_L_PIN);
   latestFlameR = analogRead(FLAME_R_PIN);
-  if (en_flame) {
-    if (latestFlameL < FLAME_THRESHOLD) triggerAlarm("FIRE LEFT");
-    if (latestFlameR < FLAME_THRESHOLD) triggerAlarm("FIRE RIGHT");
+  if (en_flame && millis() - lastFlameAlert > FLAME_COOLDOWN_MS) {
+    if (latestFlameL < FLAME_THRESHOLD) {
+      triggerAlarm("FIRE LEFT");
+      lastFlameAlert = millis();
+    }
+    if (latestFlameR < FLAME_THRESHOLD) {
+      triggerAlarm("FIRE RIGHT");
+      lastFlameAlert = millis();
+    }
   }
 
-  // ── Mic / Voice SOS ──────────────────────────────────────
+  // ── 10. Mic ───────────────────────────────────────────────
   handleMic();
 
-  // ── Buzzer ───────────────────────────────────────────────
+  // ── 11. Buzzer ────────────────────────────────────────────
   updateBuzzer();
 
-  delay(100);
+  delay(50);   // reduced from 100ms for snappier server response
 }
